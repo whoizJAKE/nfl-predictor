@@ -20,7 +20,7 @@ import pandas as pd
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
-from data import get_team_games  # noqa: E402
+from data import load_history_team_games  # noqa: E402
 from features import FeatureBuilder, make_X  # noqa: E402
 from models import CLASSIFIERS, MarginModel  # noqa: E402
 
@@ -133,7 +133,7 @@ def spread_cover_roi(
 
 
 def run_backtest(test_seasons: list[int] = TEST_SEASONS, verbose: bool = True) -> dict:
-    _, team_games = get_team_games()
+    team_games = load_history_team_games()
     fb = FeatureBuilder(team_games)
     games = fb.build_games(game_type="REG")
     X_all = make_X(games)

@@ -35,6 +35,8 @@ ROLL_STATS = [
     "points_for",
     "points_against",
 ]
+# Present on the history extract only. Rolled when the column exists.
+EXTRA_ROLL = ["early_epa_pp", "qb_epa_pp"]
 
 # Constants used ONLY to fill the first games of the dataset (2020 Week 1),
 # where no prior games exist. They are fixed, so no leakage.
@@ -45,6 +47,8 @@ FILL_VALUES = {
     "def_success_allowed": 0.45,
     "points_for": 22.0,
     "points_against": 22.0,
+    "early_epa_pp": 0.0,
+    "qb_epa_pp": 0.0,
 }
 
 
@@ -125,6 +129,26 @@ def _is_neutral(g: pd.DataFrame) -> pd.Series:
     return g["is_neutral"].astype(float)
 
 
+@feature("early_epa_diff")
+def _early_epa_diff(g: pd.DataFrame) -> pd.Series:
+    if "home_r_early_epa_pp" not in g.columns:
+        return pd.Series(0.0, index=g.index)
+    return g["home_r_early_epa_pp"] - g["away_r_early_epa_pp"]
+
+
+@feature("qb_epa_diff")
+def _qb_epa_diff(g: pd.DataFrame) -> pd.Series:
+    if "home_r_qb_epa_pp" not in g.columns:
+        return pd.Series(0.0, index=g.index)
+    return g["home_r_qb_epa_pp"] - g["away_r_qb_epa_pp"]
+
+
+@feature("market_spread_home")
+def _market_spread_home(g: pd.DataFrame) -> pd.Series:
+    # Away-perspective line -> home perspective. The market's number, as a feature.
+    return (-g["spread_line"]).fillna(0.0)
+
+
 FEATURE_COLS: list[str] = list(FEATURES)
 
 
@@ -145,13 +169,20 @@ class FeatureBuilder:
     # -- rolling -----------------------------------------------------------
     def _add_rolling(self) -> None:
         tg = self.tg
-        for stat in ROLL_STATS:
-            col = f"r_{stat}"
-            tg[col] = (
-                tg.groupby("team", observed=True)[stat]
-                .transform(lambda s: s.shift(1).rolling(ROLL_N, min_periods=1).mean())
-            )
-            tg[col] = tg[col].fillna(FILL_VALUES[stat])
+        stats = [s for s in ROLL_STATS + EXTRA_ROLL if s in tg.columns]
+        self.roll_stats = stats
+        for stat in stats:
+            if stat == "qb_epa_pp" and "qb_id" in tg.columns:
+                tg[f"r_{stat}"] = (
+                    tg.groupby("qb_id", observed=True)[stat]
+                    .transform(lambda s: s.shift(1).rolling(ROLL_N, min_periods=1).mean())
+                )
+            else:
+                tg[f"r_{stat}"] = (
+                    tg.groupby("team", observed=True)[stat]
+                    .transform(lambda s: s.shift(1).rolling(ROLL_N, min_periods=1).mean())
+                )
+            tg[f"r_{stat}"] = tg[f"r_{stat}"].fillna(FILL_VALUES[stat])
         self.tg = tg
 
     # -- Elo ---------------------------------------------------------------
@@ -229,8 +260,8 @@ class FeatureBuilder:
         )
         for prefix in ("home", "away"):
             src = home if prefix == "home" else away
-            cols = ["game_id"] + [f"r_{s}" for s in ROLL_STATS] + ["elo_before"]
-            rename = {f"r_{s}": f"{prefix}_r_{s}" for s in ROLL_STATS}
+            cols = ["game_id"] + [f"r_{s}" for s in self.roll_stats] + ["elo_before"]
+            rename = {f"r_{s}": f"{prefix}_r_{s}" for s in self.roll_stats}
             rename["elo_before"] = f"elo_{prefix}"
             m = src[cols].rename(columns=rename)
             games = games.merge(m, on="game_id", how="left")
@@ -266,10 +297,22 @@ class FeatureBuilder:
             & self.tg["points_for"].notna()
         ].tail(ROLL_N)
         out = {}
-        for stat in ROLL_STATS:
-            vals = past[stat].dropna()
-            out[f"r_{stat}"] = float(vals.mean()) if len(vals) else FILL_VALUES[stat]
+        for stat in self.roll_stats:
+            vals = past[stat].dropna() if stat in past.columns else pd.Series(dtype=float)
+            out[f"r_{stat}"] = float(vals.mean()) if len(vals) else FILL_VALUES.get(stat, 0.0)
         return out
+
+    def rolling_qb(self, qb_id: str | None, kickoff: pd.Timestamp) -> float:
+        if not qb_id or "qb_id" not in self.tg.columns:
+            return FILL_VALUES["qb_epa_pp"]
+        past = self.tg[
+            (self.tg["qb_id"] == qb_id)
+            & (self.tg["kickoff"] < kickoff)
+            & self.tg["qb_epa_pp"].notna()
+        ].tail(ROLL_N)
+        if past.empty:
+            return FILL_VALUES["qb_epa_pp"]
+        return float(past["qb_epa_pp"].mean())
 
     def features_for_matchup(
         self,
@@ -280,6 +323,9 @@ class FeatureBuilder:
         is_neutral: int = 0,
         home_rest: float | None = None,
         away_rest: float | None = None,
+        home_qb_id: str | None = None,
+        away_qb_id: str | None = None,
+        spread_line: float | None = None,
     ) -> pd.DataFrame:
         """Single-row feature matrix for a future game (same columns as make_X)."""
         h = self.rolling_for(home_team, kickoff)
@@ -290,8 +336,12 @@ class FeatureBuilder:
             "is_neutral": is_neutral,
             "home_rest": home_rest if home_rest is not None else 7.0,
             "away_rest": away_rest if away_rest is not None else 7.0,
+            "spread_line": spread_line if spread_line is not None else 0.0,
         }
-        for stat in ROLL_STATS:
+        for stat in self.roll_stats:
             row[f"home_r_{stat}"] = h[f"r_{stat}"]
             row[f"away_r_{stat}"] = a[f"r_{stat}"]
+        if "qb_epa_pp" in self.roll_stats:
+            row["home_r_qb_epa_pp"] = self.rolling_qb(home_qb_id, kickoff)
+            row["away_r_qb_epa_pp"] = self.rolling_qb(away_qb_id, kickoff)
         return make_X(pd.DataFrame([row]))

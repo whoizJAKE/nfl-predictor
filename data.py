@@ -178,3 +178,41 @@ if __name__ == "__main__":
     sched, tg = get_team_games(refresh=refresh)
     print(f"schedules: {len(sched)} games, team_games: {len(tg)} team-games")
     print(f"seasons: {sorted(sched['season'].unique())}")
+
+
+HISTORY_DIR = pathlib.Path(__file__).resolve().parent / "history"
+
+
+def load_history_team_games() -> pd.DataFrame:
+    """Team-game frame from history/team_games_joined.parquet (2006-present).
+
+    Same columns FeatureBuilder already rolls, plus early-down EPA and the
+    starter's same-game QB EPA. Same-game QB EPA is only safe after a shift;
+    FeatureBuilder does that. Points come from the schedule, not from EPA.
+    """
+    path = HISTORY_DIR / "team_games_joined.parquet"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} missing — run python history/build_history.py"
+        )
+    df = pd.read_parquet(path)
+    df["points_for"] = df["home_score"].where(df["is_home"] == 1, df["away_score"])
+    df["points_against"] = df["away_score"].where(df["is_home"] == 1, df["home_score"])
+    df["is_neutral"] = (
+        df["location"].astype(str).str.lower().eq("neutral").astype(int)
+    )
+    df["qb_epa_pp"] = df["primary_qb_epa_pp"]
+    df["qb_id"] = df["starter_qb_id"].fillna(df["primary_qb_id"])
+    df["kickoff"] = pd.to_datetime(df["kickoff"])
+    df = df[df["points_for"].notna()].copy()
+    return df.sort_values("kickoff").reset_index(drop=True)
+
+
+def load_market_games() -> pd.DataFrame:
+    """Full schedule, including unplayed games, from history/market_games.parquet."""
+    path = HISTORY_DIR / "market_games.parquet"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    df = pd.read_parquet(path)
+    df["kickoff"] = pd.to_datetime(df["kickoff"])
+    return df

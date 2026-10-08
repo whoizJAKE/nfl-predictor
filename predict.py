@@ -26,7 +26,7 @@ import pandas as pd
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from data import get_schedules, get_team_games  # noqa: E402
+from data import load_history_team_games, load_market_games  # noqa: E402
 from features import FeatureBuilder, make_X  # noqa: E402
 from models import CLASSIFIERS, MarginModel  # noqa: E402
 
@@ -43,12 +43,17 @@ def fmt_kickoff(ts: pd.Timestamp) -> str:
 
 
 def predict_week(week: int | None = None, season: int = 2026) -> pd.DataFrame:
-    schedules = get_schedules()
-    _, team_games = get_team_games()
+    schedules = load_market_games()
+    team_games = load_history_team_games()
 
     sched = schedules[
         (schedules["season"] == season) & (schedules["game_type"] == "REG")
     ].copy()
+    # History extract uses modern abbreviations. Schedule team columns do too
+    # for current seasons; team_*_pbp is the safe key either way.
+    if "team_home_pbp" in sched.columns:
+        sched["home_team"] = sched["team_home_pbp"]
+        sched["away_team"] = sched["team_away_pbp"]
     unplayed = sched[sched["home_score"].isna()]
     if unplayed.empty:
         raise SystemExit(f"No unplayed {season} regular-season games found.")
@@ -72,6 +77,8 @@ def predict_week(week: int | None = None, season: int = 2026) -> pd.DataFrame:
             g["home_team"], g["away_team"], g["kickoff"], season,
             is_neutral=neutral,
             home_rest=g.get("home_rest"), away_rest=g.get("away_rest"),
+            home_qb_id=g.get("home_qb_id"), away_qb_id=g.get("away_qb_id"),
+            spread_line=g.get("spread_line"),
         )
         probs = {m.name: float(m.predict_proba(Xf)[0, 1]) for m in models}
         pred_margin = float(margin_model.predict_margin(Xf)[0])

@@ -1,139 +1,108 @@
 # NFL Predictor
 
-Team-level NFL game prediction (v1). Trains on nflverse data (2020–present),
-predicts win probability and spread for each game, and backtests everything
-walk-forward with no lookahead. Built so a player-props / fantasy module can
-plug in later (see Roadmap).
+Team-level NFL game prediction. Walk-forward, no lookahead. Default train set is the public nflverse extract in `history/` (market lines back to 1999, EPA and QB tables from 2006). The 2020-only cache in `data.py` is still there if you want the original v1 run.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install pandas numpy scikit-learn joblib pyarrow requests tqdm appdirs
-pip install --no-deps nfl_data_py
+pip install pandas numpy scikit-learn joblib pyarrow requests
 ```
 
-> Why `--no-deps`? `nfl_data_py` pins `pandas<2.0`, which has no wheel for
-> modern Python and fails to build. It runs fine against pandas 3.x for
-> everything this project uses (verified).
+`nfl_data_py` is only required to rebuild the old `data/` cache or `history/`:
+
+```bash
+pip install --no-deps nfl_data_py   # pins pandas<2; runs fine on pandas 2/3 for this code
+python history/build_history.py     # refresh the extract. ~400MB pbp cache, gitignored
+```
 
 ## Quickstart
 
 ```bash
-python data.py        # download + cache nflverse data -> data/*.parquet (one-time)
-python backtest.py    # walk-forward backtest, 2022-2026 (takes ~2 min)
-python predict.py             # predict the next unplayed week
-python predict.py --week 7    # predict a specific 2026 week
+python backtest.py            # walk-forward on history/, test 2022-2026
+python predict.py             # next unplayed week
+python predict.py --week 7
 ```
+
+No download on those two. The parquet tables are already in `history/`.
 
 ## Architecture
 
 | File | Role |
 |---|---|
-| `data.py` | Downloads nflverse schedules + play-by-play, caches as parquet in `data/`. Builds `team_games`: one row per team per game with offensive/defensive EPA per play, success rates, points (from real offensive snaps only — no kneels/spikes). |
-| `features.py` | Causally-safe features. Rolling last-8-game team stats (shifted: strictly pre-kickoff), rest-day differential, neutral-site flag, and 538-style margin-aware Elo. `FEATURES` is a **registry dict** — add a feature by decorating a function of the games frame; models and backtest pick it up automatically. |
-| `models.py` | Three classifiers behind one `fit` / `predict_proba` interface: `EloBaseline` (fixed formula, no training), `LogisticModel` (L2, standardized), `GradientBoostingModel` (HGB). Plus `MarginModel` (HGB regressor) for fair-spread comparison. |
-| `backtest.py` | Walk-forward: for each test season (2022–2025, plus 2026 weeks so far) and each week, train on all prior games, predict that week, refit. Reports accuracy / log loss / Brier, plus two betting sims (see below). |
-| `predict.py` | CLI. Finds the next unplayed week from the schedule, trains on all completed games, prints matchup / kickoff (ET) / each model's home win prob / predicted spread / market spread / edge. Lists byes. |
+| `history/` | Joinable extract. `market_games` (1999–2026 lines, juice, weather, rest, starter QB, coach), `team_games` (2006–2026 EPA splits), `qb_games`, `team_games_joined`. See `history/HISTORY.md`. |
+| `history/build_history.py` | Rebuilds those tables from nflverse. Maps STL→LA, SD→LAC, OAK→LV so the join does not drop relocated teams. |
+| `data.py` | `load_history_team_games()` / `load_market_games()` feed the model. The old downloader (`get_team_games`, 2020–present) is still there. |
+| `features.py` | Causal features. Rolling last-8 team EPA (shifted), starter QB EPA shifted by `qb_id`, early-down EPA, rest, neutral site, 538-style Elo, and the market spread itself. |
+| `models.py` | Elo baseline, L2 logistic, hist gradient boosting, plus a margin regressor. |
+| `backtest.py` | Walk-forward. Trains on every prior game in the extract, predicts the week, refits. |
+| `predict.py` | Next unplayed week from `market_games`. |
 
 ### No-lookahead design
 
-- Rolling features use `shift(1)`: a game's features only see games kicked off *before* it.
-- Elo ratings are pre-game; updates apply after the final whistle.
-- Season boundaries: rolling windows **carry across seasons** (no reset — a reset would leave September predictions on 2-game samples); Elo instead **regresses 1/3 toward 1500** each offseason, 538-style. Documented v1 tradeoff; a mean-reversion blend is a natural upgrade.
-- Backtest refits weekly on strictly-prior data. Ties are excluded from modeling.
+- Team rolling stats use `shift(1)`. A game never sees its own EPA.
+- QB EPA is shifted on `starter_qb_id`, not on the team. Same-game dropback EPA is not a feature.
+- Elo is pre-game. Offseason regresses 1/3 toward 1500. Rolling windows carry across seasons.
+- The posted `spread_line` is a feature (`market_spread_home`). That is the close, not a leak of the result. It will make accuracy look better. It does not make a bet better.
+- Ties are dropped. `spread_line` in nflverse is away-perspective; display and bets flip it.
 
-### The spread_line convention (gotcha)
+## Backtest
 
-nflverse's `spread_line` is quoted from the **away** team's perspective
-(verified: it correlates −0.94 with `home_moneyline`). The code converts to
-home perspective (`-spread_line`) wherever a spread is displayed or bet.
-
-## Backtest results
-
-Walk-forward, 1,148 regular-season games (2022 through 2026 Week 4).
-Retrained every week on all prior games.
+Walk-forward, 1,148 regular-season games, 2022 through 2026 week 4. Trained on 2006 through the previous week. Features include early-down EPA, starter QB EPA, and the market spread.
 
 | model | accuracy | log loss | Brier | bets | profit | ROI | win rate |
 |---|---|---|---|---|---|---|---|
-| elo (baseline) | 0.636 | 0.639 | 0.224 | 667 | −63.73u | −9.6% | 47.4% |
-| logreg | **0.645** | **0.637** | **0.224** | 638 | −76.73u | −12.0% | 46.1% |
-| hgb | 0.605 | 0.755 | 0.256 | 1001 | +66.18u | +6.6% | 55.8% |
-| margin (MAE 10.83 pts) | — | — | — | 842* | +15.18u | +1.8% | 53.3% |
+| elo (baseline) | 0.636 | 0.639 | 0.224 | 668 | −66.64u | −10.0% | 47.2% |
+| logreg | 0.676 | 0.609 | 0.211 | 171 | +56.18u | +32.9% | 69.6% |
+| hgb | 0.637 | 0.652 | 0.228 | 802 | +24.64u | +3.1% | 54.0% |
+| margin (MAE 10.01 pts) | — | — | — | 591* | −41.18u | −7.0% | 48.7% |
 
-\* *Margin row uses honest spread betting: take a side at −110 only when the
-model's fair spread differs from market by >2 pts; pushes voided.*
+\* Margin row is the honest bet: −110, side only if fair spread differs from the market by more than 2 points, pushes voided.
 
-Accuracy by season (logreg): 2022: 0.669, 2023: 0.632, 2024: 0.673,
-2025: 0.616, 2026 (partial): 0.594.
+Accuracy by season (logreg): 2022: 0.669, 2023: 0.688, 2024: 0.702, 2025: 0.653, 2026 (partial): 0.641.
+
+v1 on the 2020 cache, no QB feature, no market feature: logreg accuracy 0.645, log loss 0.637, and the same honest margin sim was +1.8% on 842 bets. Longer history improved fit. It did not create a spread edge.
 
 **Honest read:**
 
-1. **The market is efficient against these features.** The two well-calibrated
-   models (Elo, logreg — best accuracy/log loss/Brier) both lose at −110 when
-   betting 5%+ probability edges. There is no free lunch in team-level EPA +
-   Elo vs the spread.
-2. **Don't trust the HGB betting ROI.** HGB is badly miscalibrated
-   (overconfident: predicts 0.82 mean in its top bin vs 0.65 actual), which
-   makes it fire on 87% of games. Its +6.6% comes from that overconfidence
-   combined with the simulation below — treat as variance, not edge.
-3. **The probability-bet simulation is stylized.** It prices every bet at −110
-   as if moneyline odds were flat; in reality a 70% favorite lays far worse
-   than −110, so it overstates favorite-betting value. The margin-model
-   spread sim (real −110 spread pricing, pushes voided) is the honest one:
-   **+1.8% over 842 bets — roughly breakeven.**
+1. Logreg accuracy went up because the closing line is now a feature. You are mostly rediscovering the market. That is not a finding.
+2. The +32.9% is the stylized probability sim (every bet priced at −110, edge vs a normal CDF of the spread). It is not a real moneyline price, and it double-counts the line once the line is a feature. Do not bet it.
+3. The number that matters is the margin model's spread sim: **−7.0% on 591 bets.** Worse than the v1 breakeven. More seasons and a QB feature did not beat the close.
+4. HGB is still the miscalibrated one. Ignore its ROI.
 
-## Sample output — Week 5, 2026 (generated 2026-10-07)
+## Sample output — Week 5, 2026 (history model, 2026-10-07)
 
 ```
 Week 5 predictions (all times ET)
   matchup        kickoff_et  p_home_elo  p_home_logreg  p_home_hgb  pred_spread  market_spread  edge_pts
- TB @ DAL Thu 10/08 8:15 PM       0.661          0.632       0.911         -7.1           -8.5      -1.4
-PHI @ JAX Sun 10/11 9:30 AM       0.698          0.748       0.814         -4.6           -7.0      -2.4
-NYG @ WAS Sun 10/11 1:00 PM       0.519          0.483       0.438          6.5           -3.5     -10.0
-HOU @ TEN Sun 10/11 1:00 PM       0.300          0.322       0.166          4.9            7.5       2.6
-IND @ PIT Sun 10/11 1:00 PM       0.618          0.578       0.619         -3.1           -2.5       0.6
-CLE @ NYJ Sun 10/11 1:00 PM       0.443          0.404       0.179          2.6           -1.5      -4.1
-  LV @ NE Sun 10/11 1:00 PM       0.769          0.711       0.828         -8.5           -3.5       5.0
-CIN @ MIA Sun 10/11 1:00 PM       0.408          0.238       0.299         -2.0            6.5       8.5
- CHI @ GB Sun 10/11 1:00 PM       0.450          0.359       0.731         -5.3            2.5       7.8
- MIN @ NO Sun 10/11 1:00 PM       0.292          0.392       0.602          0.7            1.5       0.8
-DEN @ LAC Sun 10/11 4:05 PM       0.369          0.377       0.324          1.7            3.5       1.8
-DET @ ARI Sun 10/11 4:25 PM       0.388          0.373       0.545         -0.6            5.5       6.1
- SF @ SEA Sun 10/11 4:25 PM       0.647          0.578       0.626         -8.7           -2.5       6.2
-BAL @ ATL Sun 10/11 8:20 PM       0.491          0.435       0.612          1.5           -3.5      -5.0
- BUF @ LA Mon 10/12 8:15 PM       0.525          0.490       0.280         -2.5           -3.0      -0.5
+ TB @ DAL Thu 10/08 8:15 PM       0.661          0.789       0.735         -4.1           -8.5      -4.4
+PHI @ JAX Sun 10/11 9:30 AM       0.698          0.744       0.866        -11.6           -7.0       4.6
+ CHI @ GB Sun 10/11 1:00 PM       0.450          0.404       0.442         -2.3            2.5       4.8
+CIN @ MIA Sun 10/11 1:00 PM       0.408          0.269       0.211          5.4            6.5       1.1
+  LV @ NE Sun 10/11 1:00 PM       0.769          0.604       0.528         -0.5           -3.5      -3.0
+ MIN @ NO Sun 10/11 1:00 PM       0.292          0.459       0.575         -0.2            1.5       1.7
+CLE @ NYJ Sun 10/11 1:00 PM       0.443          0.533       0.586         -2.8           -1.5       1.3
+IND @ PIT Sun 10/11 1:00 PM       0.618          0.571       0.460         -5.2           -2.5       2.7
+HOU @ TEN Sun 10/11 1:00 PM       0.300          0.260       0.087         10.5            7.5      -3.0
+NYG @ WAS Sun 10/11 1:00 PM       0.519          0.615       0.647         -3.4           -3.5      -0.1
+DEN @ LAC Sun 10/11 4:05 PM       0.369          0.371       0.397          3.2            3.5       0.3
+DET @ ARI Sun 10/11 4:25 PM       0.388          0.293       0.129         11.9            5.5      -6.4
+ SF @ SEA Sun 10/11 4:25 PM       0.647          0.535       0.414         -5.1           -2.5       2.6
+BAL @ ATL Sun 10/11 8:20 PM       0.491          0.610       0.495          0.9           -3.5      -4.4
+ BUF @ LA Mon 10/12 8:15 PM       0.525          0.579       0.543         -5.7           -3.0       2.7
 
 Byes: CAR, KC
 ```
 
-`edge_pts = market_spread − predicted_spread` (home perspective):
-positive = value on home, negative = value on away. Spreads shown home-team
-perspective (negative = home favored).
+`edge_pts = market_spread − predicted_spread` (home perspective). Positive means the market gives home a better number than the model. Not a bet recommendation. The backtest says these edges do not pay at −110.
 
-## Roadmap — player props / fantasy module (v2)
+## Roadmap — player props
 
-v1 is deliberately team-level; the seams for player-level work are already in
-place:
+Team sides are done until the price changes. Extra samples live at player level:
 
-1. **`data.py` → `build_player_games()`**: nflverse pbp already has
-   `rusher_player_id`, `receiver_player_id`, `passer_player_id`. Aggregate to
-   one row per player per game (targets, carries, air yards, EPA) and cache as
-   `player_games_<year>.parquet` next to `team_games_*`. Reuse the same
-   `_load_or_fetch` caching.
-2. **`features.py` → player registry**: the `FEATURES` registry pattern works
-   unchanged — add `@feature("wr_target_share_last4")`-style functions over a
-   player-games frame. Add injury/inactive handling (nflverse `injuries` +
-   `snaps` data) since props are voided/void-adjacent on inactives.
-3. **`models.py` → new heads**: same `fit`/`predict` interface — e.g. a
-   Poisson/negative-binomial head for receiving yards, a classifier for
-   anytime-TD. The backtest harness only needs (X, y, market_line).
-4. **`backtest.py` → prop backtest**: swap the target to the prop line
-   (over/under) with the same walk-forward loop; reuse `spread_cover_roi`
-   logic with a push rule on exactly-the-line.
-5. **Team-game features become inputs**: v1's `off_epa_diff` etc. are strong
-   priors for player props (game script drives volume) — feed them as features
-   into the prop models rather than starting from scratch.
-6. **Calibration**: v1 showed HGB is overconfident — wrap v2 probability heads
-   in `CalibratedClassifierCV` (isotonic) before any betting sim.
+1. Aggregate pbp to `player_games` (targets, carries, air yards, EPA). `history/build_history.py` already walks that pbp.
+2. Register player features the same way. Injuries and inactives void props.
+3. Poisson / negative-binomial head for yards, classifier for anytime TD.
+4. Feed `off_epa_diff` and QB EPA in as game-script priors.
+5. Calibrate before any betting sim. v1 HGB was overconfident. This run's probability ROI is the same class of mistake.
